@@ -8,120 +8,145 @@ from collections import deque
 from local_vision_bridge import GStreamerBridge
 from image_pre_processing import MovimentDetector
 
-logger = logging.getLogger("uvicorn.error")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", )
+logger = logging.getLogger("vision.main")
 
 MODEL_NAME = "qwen2.5vl:latest"
 OLLAMA_BASE_URL = "http://127.0.0.1:11434"
 
-async def analyze_temporal_sequence(frames_b64: list[str],) -> TemporalVmlModel | None:
+with open("inference_prompt. md", "r", encoding="utf-8") as f:
+    prompt_agent_inference = f.read()
+
+#variveis para controle da taxa de inferencia
+buffer_size = 4
+min_interval_inference = 5.0
+noise_ratio_max = 0.5
+max_interval = 30
+backoff_factor = 1.5
+
+
+def create_a_user_message(n_frames: int) -> str :
+    """
+    Cria uma mensagem para o agente considerando o pedido do agente com os frames
+    Considera o numero de frames  e as imagens a serem analisadas.
+    """
+
+    return (
+        f"The following {n_frames} images are consecutive video frames "
+        f"(Frame 1 = oldest, Frame {n_frames} = most recent).\n"
+        "Analyze temporal changes from Frame 1 to Frame "
+        f"{n_frames} and return the JSON."
+    )
+
+async def analyze_temporal_sequence(frames_b64: list[str],client: httpx.AsyncClient,) -> TemporalVmlModel | None:
     start_time = time.perf_counter()
     payload = {
         "model": MODEL_NAME,
         "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a temporal video understanding assistant.\n"
-                    "The images represent consecutive moments in time.\n"
-                    "Analyze the sequence chronologically from oldest to newest.\n"
-                    "Focus ONLY on changes between frames.\n"
-                    "Describe:\n"
-                    "- movement\n"
-                    "- object displacement\n"
-                    "- hand interactions\n"
-                    "- action progression\n"
-                    "- state transitions\n\n"
-                    "If nothing changes significantly, say that the scene remained mostly static.\n\n"
-                    "Respond ONLY with valid JSON.\n"
-                    'Format: {"description": "..."}'
-                ),
-            },
+            {"role": "system", "content":prompt_agent_inference},
             {
                 "role": "user",
-                "content": (
-                    "Response in Portuguese - BR\n"
-                    "These images are consecutive moments in time.\n"
-                    "Describe ONLY meaningful changes across the sequence.\n"
-                    "If the scene remains mostly unchanged, say:\n"
-                    "'No significant temporal change detected.'"
-                ),
+                "content": create_a_user_message(len(frames_b64)),
                 "images": frames_b64,
             },
         ],
         "stream": False,
         "format": "json",
-        "options": {
-            "temperature": 0
-        },
+        "options": {"temperature": 0, "seed": 42,"num_ctx": 8192 }, 
     }
-
+    t0 = time.perf_counter()
     try:
 
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await client.post(f"{OLLAMA_BASE_URL}/api/chat",json=payload)
+        response.raise_for_status()
+        raw = response.json().get("message",{}).get("content","")
+        elapsed = time.perf_counter() - t0
+        logger.info("Inferência concluída em %.2fs", elapsed)
 
-            response = await client.post(f"{OLLAMA_BASE_URL}/api/chat",json=payload)
+        parsed = json.loads(raw)
+        result = TemporalVmlModel.model_validate(parsed)
 
-            response.raise_for_status()
-            raw = response.json().get("message",{}).get("content","")
-            end_time = time.perf_counter()
-            inference_time = end_time - start_time
+        if result.confidence == "low":
+            logger.warning("VLM reportou confiança BAIXA — resultado pode ser impreciso. "
+                            "Considere ajustar threshold ou qualidade dos frames.")
 
-            print("\n====================================")
-            print(f"Tempo de inferência: {inference_time:.2f} segundos")
-            print("====================================\n")
-            
-            parsed = json.loads(raw)
-            return TemporalVmlModel.model_validate(parsed)
-
+        return result
+    
+    except json.JSONDecodeError as e:
+        logger.warning("JSON inválido retornado pelo VLM: %s | raw=%r", e, raw[:200])
+        return None
+    
     except Exception as e:
-
-        logger.warning("analyze_temporal_sequence falhou: %s",e)
+        logger.warning("analyze_temporal_sequence falhou: %s", e)
         return None
 
-async def  temporal_inference(frame_queue):
-    motion_detector = MovimentDetector(threshold=10.0)
-    frame_buffer = deque (maxlen=8)
+async def  temporal_inference(frame_queue: asyncio.Queue)-> None:
+    motion_detector = MovimentDetector(threshold=10.0, blur_threshold = 80.0)
+    frame_buffer: deque[str] = deque(maxlen=buffer_size)
     last_inference_time = 0
-    INFERENCE_INTERVAL = 5.0
+    current_interval : float = min_interval_inference
+    inference_lock = asyncio.Semaphore(1)
     
-    while True:
-        frame_b64 = await frame_queue.get()
-        frame_buffer.append(frame_b64)
-        print(f"Número de frames no buffer:{len(frame_buffer)}")
-       
-        if len (frame_buffer) < 8:
-            continue
-       
-        current_time = asyncio.get_event_loop().time()
+    async with httpx.AsyncClient(timeout=90.0) as client:
+        while True:
+            frame_b64 = await frame_queue.get()
+            frame_buffer.append(frame_b64)
+        
+            if len (frame_buffer) < buffer_size:
+                logger.debug("Buffer: %d/%d frames", len(frame_buffer), buffer_size)
+                continue
 
-        if (current_time - last_inference_time < INFERENCE_INTERVAL):
-            continue
+            now = asyncio.get_running_loop().time()
+           
+            if (now - last_inference_time) < current_interval:
+                continue
+            
+            if inference_lock.locked():
+                            logger.debug("Inferência em andamento — ciclo ignorado.")
+                            continue
 
-        motion_detected, score = (motion_detector.detection_moviment(frame_buffer[0],frame_buffer[-1]))
+            report = motion_detector.analyze_sequence(list(frame_buffer))
+            logger.info(
+                "MotionReport | detected=%s mean=%.2f max=%.2f "
+                "valid_pairs=%d noisy=%d",
+                report.motion_detected,report.mean_score, report.max_score,report.valid_pairs,report.noisy_frames,)
 
-        print(f"Motion score: {score:.2f}")
+            total_pairs = buffer_size - 1
 
-        if not motion_detected:
+            if report.noisy_frames / total_pairs > noise_ratio_max:
+                logger.warning("Muitos frames ruidosos (%d/%d) — inferência abortada.", report.noisy_frames,total_pairs,)
+                continue
 
-            print("Sem movimento relevante.")
-            continue
+            if not report.motion_detected:
+                 current_interval = min(current_interval * backoff_factor, max_interval)
+                 logger.info("Sem movimento. Próximo intervalo: %.1fs", current_interval)
+                 continue
+            
+            current_interval = min_interval_inference
+            last_inference_time = now
 
-        last_inference_time = current_time
+            async with inference_lock:
+                result = await analyze_temporal_sequence(list(frame_buffer), client)
 
-        result = await analyze_temporal_sequence(frames_b64 = list(frame_buffer))
-        if result:
-            print("\n==============================")
-            print("Descrição do que o VLM esta enxergando.")
-            print("==============================\n")
-            print(result.description)
-            print("\n==============================\n")
+            if result:
+               logger.info(
+                    "\n╔════════════════════════╗"
+                    "\n║  scene_type : %-22s║"
+                    "\n║  confidence : %-22s║"
+                    "\n╚════════════════════════╝"
+                    "\n%s\n",
+                    result.scene_type,
+                    result.confidence,
+                    result.description,)
+ 
 
 async def main ():
     frame_queue = asyncio.Queue(maxsize=2)
 
     bridge = GStreamerBridge(
         ros_topic="/camera/image_raw",
-        target_fps=2.0
+        target_fps=2.0,
+        mock=False, 
     )
 
     bridge_task = asyncio.create_task(
@@ -132,7 +157,15 @@ async def main ():
         temporal_inference (frame_queue)
     )
 
-    await asyncio.gather(bridge_task,consumer_task)
+    try:
+        
+        await asyncio.gather(bridge_task, consumer_task)
+    
+    except asyncio.CancelledError:
+        logger.info("Pipeline encerrado.")
+
+
+
 
 if __name__ == "__main__":
     asyncio.run(main())

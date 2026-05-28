@@ -108,6 +108,7 @@ class GStreamerBridge:
         if bgr and arr.ndim == 3 and arr.shape[2] == 3:
             arr = arr[:, :, ::-1]  # BGR → RGB
         img = PILImage.fromarray(arr.astype("uint8"))
+        img.thumbnail((560, 560))
         buf = BytesIO()
         img.save(buf, format="JPEG", quality=85)
         self._latest_frame_b64 = base64.b64encode(buf.getvalue()).decode()
