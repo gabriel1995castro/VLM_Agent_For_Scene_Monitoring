@@ -1,0 +1,151 @@
+robot:
+  name: "walkerXR-UFES"
+  type: "smart_walker_robot"
+  description: "Assistive robot focused on helping users with the walking process"
+
+skills:
+ 
+  navigation:
+    - id: "move_to"
+      name: "Move To Target"
+      description: "Navigate to a specific position or object in the environment"
+      parameters:
+        target: "string — object name or area"
+        speed: "slow | normal | fast"
+      preconditions:
+        - "path to target is clear"
+        - "target is visible or previously mapped"
+      postconditions:
+        - "robot is adjacent to target"
+      failure_modes:
+        - "path blocked → fallback: replan_route"
+        - "target not found → fallback: scan_environment"
+ 
+    - id: "stop"
+      name: "Stop Movement"
+      description: "Immediately halt all movement"
+      parameters: {}
+      postconditions:
+        - "robot velocity is zero"
+ 
+    - id: "replan_route"
+      name: "Replan Route"
+      description: "Calculate an alternative path when the primary route is blocked"
+      parameters:
+        target: "string — same target as original move_to"
+      preconditions:
+        - "obstacle detected on current path"
+      postconditions:
+        - "new route calculated"
+ 
+    - id: "scan_environment"
+      name: "Scan Environment"
+      description: "Rotate in place to build a 360° map of surroundings and locate objects"
+      parameters:
+        angle: "float — degrees to rotate (default 360)"
+      postconditions:
+        - "updated environment map available"
+        - "visible objects registered"
+ 
+  inspection:
+    - id: "detect_object"
+      name: "Detect Object"
+      description: "Use onboard camera to detect and locate a specific object"
+      parameters:
+        object_name: "string"
+        confidence_threshold: "float — default 0.75"
+      postconditions:
+        - "object position and state recorded"
+      failure_modes:
+        - "object not detected → fallback: reposition_for_view"
+ 
+    - id: "check_state"
+      name: "Check Object State"
+      description: "Inspect the current state of an object (open/closed, full/empty, on/off)"
+      parameters:
+        object_name: "string"
+        expected_state: "string — e.g. 'open', 'closed', 'full', 'empty'"
+      preconditions:
+        - "object has been detected"
+        - "robot is within inspection range"
+      postconditions:
+        - "object state confirmed or mismatch reported"
+ 
+    - id: "reposition_for_view"
+      name: "Reposition for Better View"
+      description: "Move to a better vantage point to improve detection or verification"
+      parameters:
+        object_name: "string"
+        offset_distance: "float — meters, default 0.5"
+      postconditions:
+        - "improved camera angle achieved"
+ 
+    - id: "check_person_presence"
+      name: "Check Person Presence"
+      description: "Detect whether the human operator is present near the target object"
+      parameters:
+        area: "string — zone or object name"
+      postconditions:
+        - "operator presence confirmed or denied"
+ 
+  human_action_verification:
+    - id: "wait_for_human_action"
+      name: "Wait for Human Action"
+      description: "Signal the human that an action is required and wait until the camera detects it as completed"
+      parameters:
+        action_description: "string — what the human needs to do, e.g. 'pick up the mug'"
+        timeout_seconds: "float — default 30"
+      preconditions:
+        - "robot has clear view of the target"
+        - "human operator is present"
+      postconditions:
+        - "human action detected as completed"
+      failure_modes:
+        - "timeout → fallback: check_person_presence then retry"
+        - "human not present → fallback: check_person_presence"
+ 
+    - id: "verify_pick_up"
+      name: "Verify Pick Up"
+      description: "Verify via camera that the human has picked up a specific object (object no longer at original position)"
+      parameters:
+        object_name: "string"
+      postconditions:
+        - "object confirmed as removed from original position"
+      failure_modes:
+        - "object still present → action not completed, retry"
+ 
+    - id: "verify_place"
+      name: "Verify Place"
+      description: "Verify via camera that the human has placed an object at the target location"
+      parameters:
+        object_name: "string"
+        target_location: "string"
+      postconditions:
+        - "object confirmed at target location"
+ 
+    - id: "verify_open"
+      name: "Verify Open"
+      description: "Verify via camera that the human has opened a door, drawer, or container"
+      parameters:
+        object_name: "string"
+      postconditions:
+        - "object state confirmed as open"
+      failure_modes:
+        - "still closed → fallback: wait_for_human_action"
+ 
+    - id: "verify_close"
+      name: "Verify Close"
+      description: "Verify via camera that the human has closed a door, drawer, or container"
+      parameters:
+        object_name: "string"
+      postconditions:
+        - "object state confirmed as closed"
+ 
+    - id: "verify_push_pull"
+      name: "Verify Push / Pull"
+      description: "Verify via camera that the human has pushed or pulled an object to the expected position"
+      parameters:
+        object_name: "string"
+        expected_position: "string — description of expected final position"
+      postconditions:
+        - "object confirmed at expected position"
